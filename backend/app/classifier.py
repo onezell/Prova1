@@ -10,9 +10,11 @@ from .models import ClassificationResult
 
 logger = logging.getLogger(__name__)
 
-CLASSIFICATION_PROMPT = """Sei un assistente che classifica le email aziendali.
+CLASSIFICATION_PROMPT = """Sei un assistente che classifica le email aziendali di una cantina di vini.
 
 Categorie disponibili: {categories}
+
+{few_shot_section}
 
 Analizza l'email seguente e rispondi SOLO con un JSON valido con questa struttura:
 {{
@@ -31,6 +33,20 @@ Corpo:
 """
 
 
+def _build_few_shot_section(examples: list[dict]) -> str:
+    """Build few-shot examples section from human corrections."""
+    if not examples:
+        return ""
+
+    lines = ["Ecco alcuni esempi di classificazioni corrette:"]
+    for ex in examples[:5]:  # max 5 examples
+        lines.append(
+            f"- Oggetto: \"{ex['subject']}\" | Da: {ex['sender']} → Categoria: {ex['category']}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _get_client() -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=settings.openai_api_key,
@@ -39,17 +55,23 @@ def _get_client() -> AsyncOpenAI:
 
 
 async def classify_email(
-    sender: str, subject: str, body: str
+    sender: str,
+    subject: str,
+    body: str,
+    few_shot_examples: list[dict] | None = None,
 ) -> ClassificationResult:
     """Classify an email using OpenAI-compatible API."""
     client = _get_client()
 
     categories_str = ", ".join(settings.categories)
+    few_shot_section = _build_few_shot_section(few_shot_examples or [])
+
     prompt = CLASSIFICATION_PROMPT.format(
         categories=categories_str,
+        few_shot_section=few_shot_section,
         sender=sender,
         subject=subject,
-        body=body[:3000],  # limit body length
+        body=body[:3000],
     )
 
     response = await client.chat.completions.create(
@@ -78,7 +100,6 @@ async def classify_email(
             "suggested_reply": "",
         }
 
-    # Validate category
     if data.get("category") not in settings.categories:
         data["category"] = "altro"
 
@@ -91,7 +112,7 @@ async def generate_custom_reply(
     """Generate a custom reply based on user instructions."""
     client = _get_client()
 
-    prompt = f"""Genera una risposta professionale in italiano per questa email.
+    prompt = f"""Genera una risposta professionale in italiano per questa email di una cantina di vini.
 
 Istruzioni aggiuntive: {instructions}
 

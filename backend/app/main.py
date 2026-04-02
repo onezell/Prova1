@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import Integer, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import (
@@ -20,7 +20,7 @@ from .auth import (
 from .classifier import classify_email, generate_custom_reply
 from .config import settings
 from .database import engine, get_db
-from .db_models import Base, EmailDB, ReplyTemplateDB
+from .db_models import Base, EmailDB, MailboxDB, ReplyTemplateDB
 from .email_client import fetch_emails, send_reply
 from .models import (
     AISettings,
@@ -29,6 +29,8 @@ from .models import (
     EmailListResponse,
     EmailOut,
     EmailSettings,
+    MailboxIn,
+    MailboxOut,
     PollingSettings,
     ReplyRequest,
     TemplateIn,
@@ -37,8 +39,27 @@ from .models import (
 from .scheduler import is_scheduler_running, start_scheduler, stop_scheduler
 from .seed import generate_mock_emails
 
+import csv
+import io
+
+from fastapi.responses import StreamingResponse
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+async def _get_few_shot_examples(db: AsyncSession, limit: int = 5) -> list[dict]:
+    """Get recent human-corrected classifications for few-shot prompting."""
+    result = await db.execute(
+        select(EmailDB)
+        .where(EmailDB.category_human.isnot(None))
+        .order_by(EmailDB.created_at.desc())
+        .limit(limit)
+    )
+    return [
+        {"subject": e.subject, "sender": e.sender, "category": e.category_human}
+        for e in result.scalars().all()
+    ]
 
 
 @asynccontextmanager
@@ -152,6 +173,55 @@ async def api_list_emails(
     )
 
 
+# ── Export CSV ──────────────────────────────────────────
+@app.get("/api/emails/export/csv")
+async def api_export_csv(
+    status: str | None = None,
+    category: str | None = None,
+    mailbox: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    query = select(EmailDB)
+    if status:
+        query = query.where(EmailDB.status == status)
+    if category:
+        query = query.where(EmailDB.category == category)
+    if mailbox:
+        query = query.where(EmailDB.mailbox == mailbox)
+    query = query.order_by(EmailDB.date.desc())
+
+    result = await db.execute(query)
+    emails = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "date", "sender", "subject", "status", "category",
+        "category_human", "confidence", "summary", "mailbox",
+    ])
+    for em in emails:
+        writer.writerow([
+            em.id,
+            em.date.isoformat() if em.date else "",
+            em.sender,
+            em.subject,
+            em.status,
+            em.category or "",
+            em.category_human or "",
+            f"{em.confidence:.2f}" if em.confidence is not None else "",
+            em.summary or "",
+            em.mailbox,
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=emails_export.csv"},
+    )
+
+
 @app.get("/api/emails/{email_id}", response_model=EmailOut)
 async def api_get_email(
     email_id: str,
@@ -175,7 +245,9 @@ async def api_classify_email(
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    result = await classify_email(em.sender, em.subject, em.body)
+    # Fetch few-shot examples from human corrections
+    few_shot = await _get_few_shot_examples(db)
+    result = await classify_email(em.sender, em.subject, em.body, few_shot)
     em.category = result.category
     em.confidence = result.confidence
     em.summary = result.summary
@@ -190,13 +262,14 @@ async def api_classify_all(
     db: AsyncSession = Depends(get_db),
     _user: str = Depends(get_current_user),
 ):
+    few_shot = await _get_few_shot_examples(db)
     result = await db.execute(select(EmailDB).where(EmailDB.status == "new"))
     emails = result.scalars().all()
     classified = []
 
     for em in emails:
         try:
-            res = await classify_email(em.sender, em.subject, em.body)
+            res = await classify_email(em.sender, em.subject, em.body, few_shot)
             em.category = res.category
             em.confidence = res.confidence
             em.summary = res.summary
@@ -512,6 +585,154 @@ async def api_stats(
         "by_status": by_status,
         "by_category": by_category,
         "pending_approval": pending,
+    }
+
+
+# ── Mailboxes ───────────────────────────────────────────
+@app.get("/api/mailboxes", response_model=list[MailboxOut])
+async def api_list_mailboxes(
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    result = await db.execute(select(MailboxDB).order_by(MailboxDB.name))
+    mailboxes = result.scalars().all()
+    out = []
+    for m in mailboxes:
+        mo = MailboxOut.model_validate(m)
+        mo.imap_password = "***" if m.imap_password else ""
+        mo.smtp_password = "***" if m.smtp_password else ""
+        out.append(mo)
+    return out
+
+
+@app.post("/api/mailboxes", response_model=MailboxOut)
+async def api_create_mailbox(
+    req: MailboxIn,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    # Check for duplicate name
+    existing = (await db.execute(select(MailboxDB).where(MailboxDB.name == req.name))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="Mailbox with this name already exists")
+    m = MailboxDB(id=str(uuid.uuid4()), **req.model_dump())
+    db.add(m)
+    await db.commit()
+    await db.refresh(m)
+    out = MailboxOut.model_validate(m)
+    out.imap_password = "***"
+    out.smtp_password = "***"
+    return out
+
+
+@app.put("/api/mailboxes/{mailbox_id}", response_model=MailboxOut)
+async def api_update_mailbox(
+    mailbox_id: str,
+    req: MailboxIn,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    m = await db.get(MailboxDB, mailbox_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+    m.name = req.name
+    m.imap_host = req.imap_host
+    m.imap_port = req.imap_port
+    m.imap_user = req.imap_user
+    if req.imap_password != "***":
+        m.imap_password = req.imap_password
+    m.smtp_host = req.smtp_host
+    m.smtp_port = req.smtp_port
+    m.smtp_user = req.smtp_user
+    if req.smtp_password != "***":
+        m.smtp_password = req.smtp_password
+    m.polling_enabled = req.polling_enabled
+    await db.commit()
+    await db.refresh(m)
+    out = MailboxOut.model_validate(m)
+    out.imap_password = "***"
+    out.smtp_password = "***"
+    return out
+
+
+@app.delete("/api/mailboxes/{mailbox_id}")
+async def api_delete_mailbox(
+    mailbox_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    m = await db.get(MailboxDB, mailbox_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+    await db.delete(m)
+    await db.commit()
+    return {"deleted": True}
+
+
+# ── Accuracy / Feedback Stats ──────────────────────────
+@app.get("/api/stats/accuracy")
+async def api_accuracy_stats(
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    """Get classification accuracy based on human corrections."""
+    # Total with human corrections
+    total_corrected = (
+        await db.execute(
+            select(func.count(EmailDB.id)).where(EmailDB.category_human.isnot(None))
+        )
+    ).scalar() or 0
+
+    if total_corrected == 0:
+        return {
+            "total_corrected": 0,
+            "correct_predictions": 0,
+            "incorrect": 0,
+            "accuracy": 0.0,
+            "by_category": {},
+        }
+
+    # Correct = AI category matches human category
+    correct = (
+        await db.execute(
+            select(func.count(EmailDB.id)).where(
+                EmailDB.category_human.isnot(None),
+                EmailDB.category == EmailDB.category_human,
+            )
+        )
+    ).scalar() or 0
+
+    incorrect = total_corrected - correct
+
+    # Breakdown by category
+    cat_rows = (
+        await db.execute(
+            select(
+                EmailDB.category_human,
+                func.count(EmailDB.id),
+                func.sum(
+                    func.cast(EmailDB.category == EmailDB.category_human, Integer)
+                ),
+            )
+            .where(EmailDB.category_human.isnot(None))
+            .group_by(EmailDB.category_human)
+        )
+    ).all()
+
+    by_category = {}
+    for cat, total, correct_count in cat_rows:
+        by_category[cat] = {
+            "total": total,
+            "correct": correct_count or 0,
+            "accuracy": round((correct_count or 0) / total, 2) if total > 0 else 0,
+        }
+
+    return {
+        "total_corrected": total_corrected,
+        "correct_predictions": correct,
+        "incorrect": incorrect,
+        "accuracy": round(correct / total_corrected, 2) if total_corrected > 0 else 0,
+        "by_category": by_category,
     }
 
 
