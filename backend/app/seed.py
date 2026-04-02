@@ -433,7 +433,7 @@ def generate_mock_emails() -> list[dict]:
         result.append(
             {
                 "id": str(uuid.uuid4()),
-                "message_id": f"<mock-{uuid.uuid4().hex[:8]}@cantina-test.it>",
+                "message_id": f"<mock-{i:04d}@cantina-test.it>",
                 "uid": 1000 + i,
                 "mailbox": "default",
                 "subject": mock["subject"],
