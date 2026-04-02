@@ -1,26 +1,32 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Zap, Filter } from 'lucide-react'
+import { RefreshCw, Zap, Filter, ChevronLeft, ChevronRight } from 'lucide-react'
 import { listEmails, fetchEmails, classifyAll } from '../api'
 import StatusBadge from '../components/StatusBadge'
 import CategoryBadge from '../components/CategoryBadge'
 
 export default function EmailList() {
   const [emails, setEmails] = useState([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
+  const pageSize = 20
 
   const load = async () => {
     try {
-      const { data } = await listEmails(filter || undefined)
-      setEmails(data)
+      const params = { page, page_size: pageSize }
+      if (filter) params.status = filter
+      const { data } = await listEmails(params)
+      setEmails(data.emails)
+      setTotal(data.total)
     } catch {
       /* empty */
     }
   }
 
-  useEffect(() => { load() }, [filter])
+  useEffect(() => { load() }, [filter, page])
 
   const handleFetch = async () => {
     setLoading(true)
@@ -44,16 +50,18 @@ export default function EmailList() {
     setLoading(false)
   }
 
+  const totalPages = Math.ceil(total / pageSize)
+
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-gray-800">Email</h1>
+        <h1 className="text-2xl font-bold text-gray-800">Email ({total})</h1>
         <div className="flex gap-3">
           <div className="flex items-center gap-2 bg-white border rounded-lg px-3 py-2">
             <Filter className="h-4 w-4 text-gray-400" />
             <select
               value={filter}
-              onChange={(e) => setFilter(e.target.value)}
+              onChange={(e) => { setFilter(e.target.value); setPage(1) }}
               className="bg-transparent border-none outline-none text-sm"
             >
               <option value="">Tutte</option>
@@ -117,6 +125,28 @@ export default function EmailList() {
           </tbody>
         </table>
       </div>
+
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-4 mt-4">
+          <button
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            disabled={page === 1}
+            className="p-2 rounded-lg hover:bg-gray-200 disabled:opacity-30"
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+          <span className="text-sm text-gray-600">
+            Pagina {page} di {totalPages}
+          </span>
+          <button
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            disabled={page === totalPages}
+            className="p-2 rounded-lg hover:bg-gray-200 disabled:opacity-30"
+          >
+            <ChevronRight className="h-5 w-5" />
+          </button>
+        </div>
+      )}
     </div>
   )
 }

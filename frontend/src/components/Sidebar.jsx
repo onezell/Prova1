@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Mail, Settings, BarChart3 } from 'lucide-react'
+import { LayoutDashboard, Mail, Settings, BarChart3, LogOut, User } from 'lucide-react'
 
 const links = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
@@ -8,14 +8,14 @@ const links = [
   { to: '/settings', icon: Settings, label: 'Impostazioni' },
 ]
 
-export default function Sidebar() {
+export default function Sidebar({ user, onLogout }) {
   return (
     <aside className="w-64 bg-gray-900 text-white min-h-screen p-4 flex flex-col">
       <h1 className="text-xl font-bold mb-8 px-2">
         <Mail className="inline mr-2 h-6 w-6" />
         Email AI
       </h1>
-      <nav className="flex flex-col gap-1">
+      <nav className="flex flex-col gap-1 flex-1">
         {links.map(({ to, icon: Icon, label }) => (
           <NavLink
             key={to}
@@ -31,6 +31,19 @@ export default function Sidebar() {
           </NavLink>
         ))}
       </nav>
+      <div className="border-t border-gray-700 pt-3 mt-3">
+        <div className="flex items-center gap-2 px-3 py-2 text-sm text-gray-400">
+          <User className="h-4 w-4" />
+          {user}
+        </div>
+        <button
+          onClick={onLogout}
+          className="flex items-center gap-2 px-3 py-2 text-sm text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg w-full transition-colors"
+        >
+          <LogOut className="h-4 w-4" />
+          Esci
+        </button>
+      </div>
     </aside>
   )
 }

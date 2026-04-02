@@ -2,61 +2,109 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from .auth import (
+    LoginRequest,
+    Token,
+    authenticate_user,
+    create_token,
+    create_tokens,
+    get_current_user,
+)
 from .classifier import classify_email, generate_custom_reply
 from .config import settings
+from .database import engine, get_db
+from .db_models import Base, EmailDB
 from .email_client import fetch_emails, send_reply
+from .seed import generate_mock_emails
 from .models import (
     AISettings,
-    Email,
+    CorrectCategoryRequest,
+    EmailListResponse,
+    EmailOut,
     EmailSettings,
-    EmailStatus,
     ReplyRequest,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-memory store for POC
-email_store: dict[str, Email] = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Email AI Classifier POC started")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Email AI Classifier POC started — database ready")
     yield
 
 
-app = FastAPI(title="Email AI Classifier", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Email AI Classifier", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ── Auth ────────────────────────────────────────────────
+@app.post("/api/auth/login", response_model=Token)
+async def login(req: LoginRequest):
+    user = authenticate_user(req.username, req.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Credenziali non valide")
+    return create_tokens(user)
+
+
+@app.post("/api/auth/refresh", response_model=Token)
+async def refresh(user: str = Depends(get_current_user)):
+    return create_tokens(user)
+
+
+@app.get("/api/auth/me")
+async def me(user: str = Depends(get_current_user)):
+    return {"username": user}
+
+
 # ── Health ──────────────────────────────────────────────
 @app.get("/api/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
 # ── Emails ──────────────────────────────────────────────
 @app.post("/api/emails/fetch")
-def api_fetch_emails(limit: int = 50):
-    """Fetch emails from the configured mailbox."""
+async def api_fetch_emails(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
     try:
-        emails = fetch_emails(limit=limit)
-        for em in emails:
-            if em.id not in email_store:
-                email_store[em.id] = em
-        return {"count": len(emails), "emails": emails}
+        raw_emails = fetch_emails(limit=limit)
+        added = 0
+        for em in raw_emails:
+            # Deduplicate by message_id
+            if em.get("message_id"):
+                existing = await db.execute(
+                    select(EmailDB).where(EmailDB.message_id == em["message_id"])
+                )
+                if existing.scalar_one_or_none():
+                    continue
+
+            db_email = EmailDB(**em)
+            db.add(db_email)
+            added += 1
+
+        await db.commit()
+        return {"fetched": len(raw_emails), "added": added}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -64,71 +112,138 @@ def api_fetch_emails(limit: int = 50):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/emails")
-def api_list_emails(status: str | None = None):
-    """List all cached emails, optionally filtered by status."""
-    emails = list(email_store.values())
+@app.get("/api/emails", response_model=EmailListResponse)
+async def api_list_emails(
+    status: str | None = None,
+    category: str | None = None,
+    mailbox: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    query = select(EmailDB)
+    count_query = select(func.count(EmailDB.id))
+
     if status:
-        emails = [e for e in emails if e.status == status]
-    emails.sort(key=lambda e: e.date, reverse=True)
-    return emails
+        query = query.where(EmailDB.status == status)
+        count_query = count_query.where(EmailDB.status == status)
+    if category:
+        query = query.where(EmailDB.category == category)
+        count_query = count_query.where(EmailDB.category == category)
+    if mailbox:
+        query = query.where(EmailDB.mailbox == mailbox)
+        count_query = count_query.where(EmailDB.mailbox == mailbox)
+
+    total = (await db.execute(count_query)).scalar() or 0
+
+    query = query.order_by(EmailDB.date.desc())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    emails = result.scalars().all()
+
+    return EmailListResponse(
+        emails=[EmailOut.model_validate(e) for e in emails],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-@app.get("/api/emails/{email_id}")
-def api_get_email(email_id: str):
-    if email_id not in email_store:
+@app.get("/api/emails/{email_id}", response_model=EmailOut)
+async def api_get_email(
+    email_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    em = await db.get(EmailDB, email_id)
+    if not em:
         raise HTTPException(status_code=404, detail="Email not found")
-    return email_store[email_id]
+    return EmailOut.model_validate(em)
 
 
 # ── Classification ──────────────────────────────────────
 @app.post("/api/emails/{email_id}/classify")
-async def api_classify_email(email_id: str):
-    """Classify a single email."""
-    if email_id not in email_store:
+async def api_classify_email(
+    email_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    em = await db.get(EmailDB, email_id)
+    if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    em = email_store[email_id]
     result = await classify_email(em.sender, em.subject, em.body)
-
     em.category = result.category
     em.confidence = result.confidence
+    em.summary = result.summary
     em.suggested_reply = result.suggested_reply
-    em.status = EmailStatus.classified
+    em.status = "classified"
+    await db.commit()
 
     return {"email_id": email_id, "classification": result}
 
 
 @app.post("/api/emails/classify-all")
-async def api_classify_all():
-    """Classify all unclassified emails."""
-    results = []
-    for em in email_store.values():
-        if em.status == EmailStatus.new:
-            try:
-                result = await classify_email(em.sender, em.subject, em.body)
-                em.category = result.category
-                em.confidence = result.confidence
-                em.suggested_reply = result.suggested_reply
-                em.status = EmailStatus.classified
-                results.append({"email_id": em.id, "category": result.category})
-            except Exception:
-                logger.exception("Classification failed for %s", em.id)
-    return {"classified": len(results), "results": results}
+async def api_classify_all(
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    result = await db.execute(select(EmailDB).where(EmailDB.status == "new"))
+    emails = result.scalars().all()
+    classified = []
+
+    for em in emails:
+        try:
+            res = await classify_email(em.sender, em.subject, em.body)
+            em.category = res.category
+            em.confidence = res.confidence
+            em.summary = res.summary
+            em.suggested_reply = res.suggested_reply
+            em.status = "classified"
+            classified.append({"email_id": em.id, "category": res.category})
+        except Exception:
+            logger.exception("Classification failed for %s", em.id)
+
+    await db.commit()
+    return {"classified": len(classified), "results": classified}
+
+
+@app.post("/api/emails/{email_id}/correct")
+async def api_correct_category(
+    email_id: str,
+    req: CorrectCategoryRequest,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    em = await db.get(EmailDB, email_id)
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    em.category_human = req.category
+    await db.commit()
+    return {"email_id": email_id, "category_human": req.category}
 
 
 # ── Reply ───────────────────────────────────────────────
 @app.post("/api/emails/{email_id}/reply")
-async def api_send_reply(email_id: str, req: ReplyRequest):
-    """Send a reply to an email."""
-    if email_id not in email_store:
+async def api_send_reply(
+    email_id: str,
+    req: ReplyRequest,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    em = await db.get(EmailDB, email_id)
+    if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    em = email_store[email_id]
     try:
         await send_reply(to=em.sender, subject=em.subject, body=req.reply_text)
         em.reply_sent = True
-        em.status = EmailStatus.replied
+        em.reply_text = req.reply_text
+        em.replied_at = datetime.now(timezone.utc)
+        em.status = "replied"
+        await db.commit()
         return {"success": True}
     except Exception as e:
         logger.exception("Reply failed")
@@ -136,19 +251,23 @@ async def api_send_reply(email_id: str, req: ReplyRequest):
 
 
 @app.post("/api/emails/{email_id}/generate-reply")
-async def api_generate_reply(email_id: str, instructions: str = ""):
-    """Generate a custom reply using AI."""
-    if email_id not in email_store:
+async def api_generate_reply(
+    email_id: str,
+    instructions: str = "",
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    em = await db.get(EmailDB, email_id)
+    if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    em = email_store[email_id]
     reply = await generate_custom_reply(em.sender, em.subject, em.body, instructions)
     return {"reply": reply}
 
 
 # ── Settings ────────────────────────────────────────────
 @app.get("/api/settings/email")
-def api_get_email_settings():
+async def api_get_email_settings(_user: str = Depends(get_current_user)):
     return EmailSettings(
         imap_host=settings.imap_host,
         imap_port=settings.imap_port,
@@ -162,7 +281,9 @@ def api_get_email_settings():
 
 
 @app.put("/api/settings/email")
-def api_update_email_settings(s: EmailSettings):
+async def api_update_email_settings(
+    s: EmailSettings, _user: str = Depends(get_current_user)
+):
     settings.imap_host = s.imap_host
     settings.imap_port = s.imap_port
     settings.imap_user = s.imap_user
@@ -177,7 +298,7 @@ def api_update_email_settings(s: EmailSettings):
 
 
 @app.get("/api/settings/ai")
-def api_get_ai_settings():
+async def api_get_ai_settings(_user: str = Depends(get_current_user)):
     return AISettings(
         openai_api_key="***" if settings.openai_api_key else "",
         openai_base_url=settings.openai_base_url,
@@ -187,7 +308,9 @@ def api_get_ai_settings():
 
 
 @app.put("/api/settings/ai")
-def api_update_ai_settings(s: AISettings):
+async def api_update_ai_settings(
+    s: AISettings, _user: str = Depends(get_current_user)
+):
     if s.openai_api_key != "***":
         settings.openai_api_key = s.openai_api_key
     settings.openai_base_url = s.openai_base_url
@@ -198,17 +321,50 @@ def api_update_ai_settings(s: AISettings):
 
 # ── Stats ───────────────────────────────────────────────
 @app.get("/api/stats")
-def api_stats():
-    emails = list(email_store.values())
-    total = len(emails)
-    by_status = {}
-    by_category = {}
-    for em in emails:
-        by_status[em.status] = by_status.get(em.status, 0) + 1
-        if em.category:
-            by_category[em.category] = by_category.get(em.category, 0) + 1
-    return {
-        "total": total,
-        "by_status": by_status,
-        "by_category": by_category,
-    }
+async def api_stats(
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    total = (await db.execute(select(func.count(EmailDB.id)))).scalar() or 0
+
+    # By status
+    status_rows = (
+        await db.execute(
+            select(EmailDB.status, func.count(EmailDB.id)).group_by(EmailDB.status)
+        )
+    ).all()
+    by_status = {row[0]: row[1] for row in status_rows}
+
+    # By category
+    cat_rows = (
+        await db.execute(
+            select(EmailDB.category, func.count(EmailDB.id))
+            .where(EmailDB.category.isnot(None))
+            .group_by(EmailDB.category)
+        )
+    ).all()
+    by_category = {row[0]: row[1] for row in cat_rows}
+
+    return {"total": total, "by_status": by_status, "by_category": by_category}
+
+
+# ── Seed (demo data) ───────────────────────────────────
+@app.post("/api/seed")
+async def api_seed(
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    """Load mock emails for demo purposes."""
+    mocks = generate_mock_emails()
+    added = 0
+    for em in mocks:
+        existing = await db.execute(
+            select(EmailDB).where(EmailDB.message_id == em["message_id"])
+        )
+        if existing.scalar_one_or_none():
+            continue
+        db.add(EmailDB(**em))
+        added += 1
+
+    await db.commit()
+    return {"added": added, "total": len(mocks)}

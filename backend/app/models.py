@@ -1,30 +1,38 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
 from pydantic import BaseModel
 
 
-class EmailStatus(str, Enum):
-    new = "new"
-    classified = "classified"
-    replied = "replied"
-    skipped = "skipped"
-
-
-class Email(BaseModel):
+class EmailOut(BaseModel):
     id: str
+    message_id: str | None = None
     uid: int
+    mailbox: str = "default"
     subject: str
     sender: str
     date: datetime
     body: str
     body_html: str = ""
-    status: EmailStatus = EmailStatus.new
+    status: str = "new"
     category: str | None = None
+    category_human: str | None = None
     confidence: float | None = None
+    summary: str | None = None
     suggested_reply: str | None = None
     reply_sent: bool = False
+    reply_text: str | None = None
+    replied_at: datetime | None = None
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class EmailListResponse(BaseModel):
+    emails: list[EmailOut]
+    total: int
+    page: int
+    page_size: int
 
 
 class ClassificationResult(BaseModel):
@@ -55,3 +63,7 @@ class AISettings(BaseModel):
 class ReplyRequest(BaseModel):
     email_id: str
     reply_text: str
+
+
+class CorrectCategoryRequest(BaseModel):
+    category: str
