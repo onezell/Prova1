@@ -9,6 +9,9 @@ venv/
 .env
 *.env.local
 
+# Data
+backend/data/
+
 # Build
 frontend/dist/
 *.egg-info/
