@@ -36,6 +36,23 @@ class EmailDB(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class MailboxDB(Base):
+    __tablename__ = "mailboxes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    imap_host: Mapped[str] = mapped_column(String(255))
+    imap_port: Mapped[int] = mapped_column(Integer, default=993)
+    imap_user: Mapped[str] = mapped_column(String(255))
+    imap_password: Mapped[str] = mapped_column(String(255))
+    smtp_host: Mapped[str] = mapped_column(String(255))
+    smtp_port: Mapped[int] = mapped_column(Integer, default=587)
+    smtp_user: Mapped[str] = mapped_column(String(255))
+    smtp_password: Mapped[str] = mapped_column(String(255))
+    polling_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class ReplyTemplateDB(Base):
     __tablename__ = "reply_templates"
 

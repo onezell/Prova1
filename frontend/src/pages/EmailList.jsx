@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { RefreshCw, Zap, Filter, ChevronLeft, ChevronRight } from 'lucide-react'
-import { listEmails, fetchEmails, classifyAll } from '../api'
+import { RefreshCw, Zap, Filter, ChevronLeft, ChevronRight, Download } from 'lucide-react'
+import { listEmails, fetchEmails, classifyAll, exportCSV, listMailboxes } from '../api'
 import StatusBadge from '../components/StatusBadge'
 import CategoryBadge from '../components/CategoryBadge'
 
@@ -10,14 +10,21 @@ export default function EmailList() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState('')
+  const [mailboxFilter, setMailboxFilter] = useState('')
+  const [mailboxes, setMailboxes] = useState([])
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
   const pageSize = 20
+
+  useEffect(() => {
+    listMailboxes().then(({ data }) => setMailboxes(data)).catch(() => {})
+  }, [])
 
   const load = async () => {
     try {
       const params = { page, page_size: pageSize }
       if (filter) params.status = filter
+      if (mailboxFilter) params.mailbox = mailboxFilter
       const { data } = await listEmails(params)
       setEmails(data.emails)
       setTotal(data.total)
@@ -26,7 +33,7 @@ export default function EmailList() {
     }
   }
 
-  useEffect(() => { load() }, [filter, page])
+  useEffect(() => { load() }, [filter, mailboxFilter, page])
 
   const handleFetch = async () => {
     setLoading(true)
@@ -50,13 +57,30 @@ export default function EmailList() {
     setLoading(false)
   }
 
+  const handleExport = async () => {
+    try {
+      const params = {}
+      if (filter) params.status = filter
+      if (mailboxFilter) params.mailbox = mailboxFilter
+      const { data } = await exportCSV(params)
+      const url = URL.createObjectURL(data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'emails_export.csv'
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      /* empty */
+    }
+  }
+
   const totalPages = Math.ceil(total / pageSize)
 
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-800">Email ({total})</h1>
-        <div className="flex gap-3">
+        <div className="flex gap-3 flex-wrap">
           <div className="flex items-center gap-2 bg-white border rounded-lg px-3 py-2">
             <Filter className="h-4 w-4 text-gray-400" />
             <select
@@ -67,9 +91,29 @@ export default function EmailList() {
               <option value="">Tutte</option>
               <option value="new">Nuove</option>
               <option value="classified">Classificate</option>
+              <option value="pending_approval">In approvazione</option>
+              <option value="approved">Approvate</option>
               <option value="replied">Con risposta</option>
             </select>
           </div>
+          {mailboxes.length > 0 && (
+            <div className="flex items-center gap-2 bg-white border rounded-lg px-3 py-2">
+              <select
+                value={mailboxFilter}
+                onChange={(e) => { setMailboxFilter(e.target.value); setPage(1) }}
+                className="bg-transparent border-none outline-none text-sm"
+              >
+                <option value="">Tutte le caselle</option>
+                {mailboxes.map((m) => (
+                  <option key={m.id} value={m.name}>{m.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <button onClick={handleExport} className="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-200 border">
+            <Download className="h-4 w-4" />
+            CSV
+          </button>
           <button onClick={handleFetch} disabled={loading} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50">
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             Recupera

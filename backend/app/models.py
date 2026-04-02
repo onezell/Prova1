@@ -94,3 +94,33 @@ class PollingSettings(BaseModel):
     polling_enabled: bool
     polling_interval_seconds: int
     auto_approve_threshold: float
+
+
+class MailboxIn(BaseModel):
+    name: str
+    imap_host: str
+    imap_port: int = 993
+    imap_user: str
+    imap_password: str
+    smtp_host: str
+    smtp_port: int = 587
+    smtp_user: str
+    smtp_password: str
+    polling_enabled: bool = True
+
+
+class MailboxOut(BaseModel):
+    id: str
+    name: str
+    imap_host: str
+    imap_port: int
+    imap_user: str
+    imap_password: str = "***"
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_password: str = "***"
+    polling_enabled: bool
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
