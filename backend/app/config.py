@@ -40,6 +40,13 @@ class Settings(BaseSettings):
         "altro",
     ]
 
+    # Polling
+    polling_enabled: bool = False
+    polling_interval_seconds: int = 300  # 5 minutes
+
+    # Approval workflow
+    auto_approve_threshold: float = 0.0  # 0 = disabled, e.g. 0.9 = auto-approve above 90%
+
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 

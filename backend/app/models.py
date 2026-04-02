@@ -67,3 +67,30 @@ class ReplyRequest(BaseModel):
 
 class CorrectCategoryRequest(BaseModel):
     category: str
+
+
+class ApproveRequest(BaseModel):
+    reply_text: str | None = None  # optional override
+
+
+class TemplateIn(BaseModel):
+    category: str
+    title: str
+    body: str
+
+
+class TemplateOut(BaseModel):
+    id: str
+    category: str
+    title: str
+    body: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class PollingSettings(BaseModel):
+    polling_enabled: bool
+    polling_interval_seconds: int
+    auto_approve_threshold: float

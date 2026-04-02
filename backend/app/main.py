@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -13,24 +14,28 @@ from .auth import (
     LoginRequest,
     Token,
     authenticate_user,
-    create_token,
     create_tokens,
     get_current_user,
 )
 from .classifier import classify_email, generate_custom_reply
 from .config import settings
 from .database import engine, get_db
-from .db_models import Base, EmailDB
+from .db_models import Base, EmailDB, ReplyTemplateDB
 from .email_client import fetch_emails, send_reply
-from .seed import generate_mock_emails
 from .models import (
     AISettings,
+    ApproveRequest,
     CorrectCategoryRequest,
     EmailListResponse,
     EmailOut,
     EmailSettings,
+    PollingSettings,
     ReplyRequest,
+    TemplateIn,
+    TemplateOut,
 )
+from .scheduler import is_scheduler_running, start_scheduler, stop_scheduler
+from .seed import generate_mock_emails
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,11 +45,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Email AI Classifier POC started — database ready")
+    logger.info("Email AI Classifier POC v0.3 started — database ready")
+    start_scheduler()
     yield
+    stop_scheduler()
 
 
-app = FastAPI(title="Email AI Classifier", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Email AI Classifier", version="0.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,7 +84,7 @@ async def me(user: str = Depends(get_current_user)):
 # ── Health ──────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "scheduler": is_scheduler_running()}
 
 
 # ── Emails ──────────────────────────────────────────────
@@ -91,18 +98,14 @@ async def api_fetch_emails(
         raw_emails = fetch_emails(limit=limit)
         added = 0
         for em in raw_emails:
-            # Deduplicate by message_id
             if em.get("message_id"):
                 existing = await db.execute(
                     select(EmailDB).where(EmailDB.message_id == em["message_id"])
                 )
                 if existing.scalar_one_or_none():
                     continue
-
-            db_email = EmailDB(**em)
-            db.add(db_email)
+            db.add(EmailDB(**em))
             added += 1
-
         await db.commit()
         return {"fetched": len(raw_emails), "added": added}
     except ValueError as e:
@@ -136,7 +139,6 @@ async def api_list_emails(
         count_query = count_query.where(EmailDB.mailbox == mailbox)
 
     total = (await db.execute(count_query)).scalar() or 0
-
     query = query.order_by(EmailDB.date.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
@@ -180,7 +182,6 @@ async def api_classify_email(
     em.suggested_reply = result.suggested_reply
     em.status = "classified"
     await db.commit()
-
     return {"email_id": email_id, "classification": result}
 
 
@@ -219,10 +220,69 @@ async def api_correct_category(
     em = await db.get(EmailDB, email_id)
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
-
     em.category_human = req.category
     await db.commit()
     return {"email_id": email_id, "category_human": req.category}
+
+
+# ── Approval Workflow ───────────────────────────────────
+@app.post("/api/emails/{email_id}/submit-for-approval")
+async def api_submit_for_approval(
+    email_id: str,
+    req: ReplyRequest,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    """Submit a reply for approval (status → pending_approval)."""
+    em = await db.get(EmailDB, email_id)
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    em.suggested_reply = req.reply_text
+    em.status = "pending_approval"
+    await db.commit()
+    return {"email_id": email_id, "status": "pending_approval"}
+
+
+@app.post("/api/emails/{email_id}/approve")
+async def api_approve_email(
+    email_id: str,
+    req: ApproveRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: str = Depends(get_current_user),
+):
+    """Approve a pending reply (status → approved). Optionally override reply text."""
+    em = await db.get(EmailDB, email_id)
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if em.status not in ("classified", "pending_approval"):
+        raise HTTPException(status_code=400, detail=f"Cannot approve email with status '{em.status}'")
+
+    if req and req.reply_text:
+        em.suggested_reply = req.reply_text
+    em.status = "approved"
+    em.approved_by = user
+    em.approved_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"email_id": email_id, "status": "approved", "approved_by": user}
+
+
+@app.post("/api/emails/{email_id}/reject")
+async def api_reject_email(
+    email_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    """Reject a pending reply (status → classified)."""
+    em = await db.get(EmailDB, email_id)
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if em.status != "pending_approval":
+        raise HTTPException(status_code=400, detail="Email is not pending approval")
+    em.status = "classified"
+    em.approved_by = None
+    em.approved_at = None
+    await db.commit()
+    return {"email_id": email_id, "status": "classified"}
 
 
 # ── Reply ───────────────────────────────────────────────
@@ -260,9 +320,85 @@ async def api_generate_reply(
     em = await db.get(EmailDB, email_id)
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
-
     reply = await generate_custom_reply(em.sender, em.subject, em.body, instructions)
     return {"reply": reply}
+
+
+# ── Templates ───────────────────────────────────────────
+@app.get("/api/templates", response_model=list[TemplateOut])
+async def api_list_templates(
+    category: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    query = select(ReplyTemplateDB).order_by(ReplyTemplateDB.category)
+    if category:
+        query = query.where(ReplyTemplateDB.category == category)
+    result = await db.execute(query)
+    return [TemplateOut.model_validate(t) for t in result.scalars().all()]
+
+
+@app.post("/api/templates", response_model=TemplateOut)
+async def api_create_template(
+    req: TemplateIn,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    t = ReplyTemplateDB(
+        id=str(uuid.uuid4()),
+        category=req.category,
+        title=req.title,
+        body=req.body,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return TemplateOut.model_validate(t)
+
+
+@app.get("/api/templates/{template_id}", response_model=TemplateOut)
+async def api_get_template(
+    template_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    t = await db.get(ReplyTemplateDB, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return TemplateOut.model_validate(t)
+
+
+@app.put("/api/templates/{template_id}", response_model=TemplateOut)
+async def api_update_template(
+    template_id: str,
+    req: TemplateIn,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    t = await db.get(ReplyTemplateDB, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    t.category = req.category
+    t.title = req.title
+    t.body = req.body
+    t.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(t)
+    return TemplateOut.model_validate(t)
+
+
+@app.delete("/api/templates/{template_id}")
+async def api_delete_template(
+    template_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    t = await db.get(ReplyTemplateDB, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await db.delete(t)
+    await db.commit()
+    return {"deleted": True}
 
 
 # ── Settings ────────────────────────────────────────────
@@ -319,6 +455,25 @@ async def api_update_ai_settings(
     return {"status": "updated"}
 
 
+@app.get("/api/settings/polling", response_model=PollingSettings)
+async def api_get_polling_settings(_user: str = Depends(get_current_user)):
+    return PollingSettings(
+        polling_enabled=settings.polling_enabled,
+        polling_interval_seconds=settings.polling_interval_seconds,
+        auto_approve_threshold=settings.auto_approve_threshold,
+    )
+
+
+@app.put("/api/settings/polling")
+async def api_update_polling_settings(
+    s: PollingSettings, _user: str = Depends(get_current_user)
+):
+    settings.polling_enabled = s.polling_enabled
+    settings.polling_interval_seconds = s.polling_interval_seconds
+    settings.auto_approve_threshold = s.auto_approve_threshold
+    return {"status": "updated"}
+
+
 # ── Stats ───────────────────────────────────────────────
 @app.get("/api/stats")
 async def api_stats(
@@ -327,7 +482,6 @@ async def api_stats(
 ):
     total = (await db.execute(select(func.count(EmailDB.id)))).scalar() or 0
 
-    # By status
     status_rows = (
         await db.execute(
             select(EmailDB.status, func.count(EmailDB.id)).group_by(EmailDB.status)
@@ -335,7 +489,6 @@ async def api_stats(
     ).all()
     by_status = {row[0]: row[1] for row in status_rows}
 
-    # By category
     cat_rows = (
         await db.execute(
             select(EmailDB.category, func.count(EmailDB.id))
@@ -345,7 +498,21 @@ async def api_stats(
     ).all()
     by_category = {row[0]: row[1] for row in cat_rows}
 
-    return {"total": total, "by_status": by_status, "by_category": by_category}
+    # Pending approval count
+    pending = (
+        await db.execute(
+            select(func.count(EmailDB.id)).where(
+                EmailDB.status == "pending_approval"
+            )
+        )
+    ).scalar() or 0
+
+    return {
+        "total": total,
+        "by_status": by_status,
+        "by_category": by_category,
+        "pending_approval": pending,
+    }
 
 
 # ── Seed (demo data) ───────────────────────────────────
@@ -354,7 +521,6 @@ async def api_seed(
     db: AsyncSession = Depends(get_db),
     _user: str = Depends(get_current_user),
 ):
-    """Load mock emails for demo purposes."""
     mocks = generate_mock_emails()
     added = 0
     for em in mocks:
@@ -365,6 +531,5 @@ async def api_seed(
             continue
         db.add(EmailDB(**em))
         added += 1
-
     await db.commit()
     return {"added": added, "total": len(mocks)}

@@ -1,9 +1,11 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Mail, Settings, BarChart3, LogOut, User } from 'lucide-react'
+import { LayoutDashboard, Mail, Settings, BarChart3, LogOut, User, ClipboardCheck, FileText } from 'lucide-react'
 
 const links = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/emails', icon: Mail, label: 'Email' },
+  { to: '/approvals', icon: ClipboardCheck, label: 'Approvazioni' },
+  { to: '/templates', icon: FileText, label: 'Template' },
   { to: '/stats', icon: BarChart3, label: 'Statistiche' },
   { to: '/settings', icon: Settings, label: 'Impostazioni' },
 ]

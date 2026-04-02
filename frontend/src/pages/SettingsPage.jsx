@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Save, CheckCircle } from 'lucide-react'
-import { getEmailSettings, updateEmailSettings, getAISettings, updateAISettings } from '../api'
+import { getEmailSettings, updateEmailSettings, getAISettings, updateAISettings, getPollingSettings, updatePollingSettings } from '../api'
 
 function Field({ label, value, onChange, type = 'text', placeholder = '' }) {
   return (
@@ -20,29 +20,26 @@ function Field({ label, value, onChange, type = 'text', placeholder = '' }) {
 export default function SettingsPage() {
   const [emailConf, setEmailConf] = useState(null)
   const [aiConf, setAIConf] = useState(null)
+  const [pollingConf, setPollingConf] = useState(null)
   const [saved, setSaved] = useState('')
 
   useEffect(() => {
     getEmailSettings().then(({ data }) => setEmailConf(data))
     getAISettings().then(({ data }) => setAIConf(data))
+    getPollingSettings().then(({ data }) => setPollingConf(data))
   }, [])
 
-  const saveEmail = async () => {
-    await updateEmailSettings(emailConf)
-    setSaved('email')
-    setTimeout(() => setSaved(''), 2000)
-  }
+  const flash = (key) => { setSaved(key); setTimeout(() => setSaved(''), 2000) }
 
-  const saveAI = async () => {
-    await updateAISettings(aiConf)
-    setSaved('ai')
-    setTimeout(() => setSaved(''), 2000)
-  }
+  const saveEmail = async () => { await updateEmailSettings(emailConf); flash('email') }
+  const saveAI = async () => { await updateAISettings(aiConf); flash('ai') }
+  const savePolling = async () => { await updatePollingSettings(pollingConf); flash('polling') }
 
   const updateEmail = (key, val) => setEmailConf((prev) => ({ ...prev, [key]: val }))
   const updateAI = (key, val) => setAIConf((prev) => ({ ...prev, [key]: val }))
+  const updatePolling = (key, val) => setPollingConf((prev) => ({ ...prev, [key]: val }))
 
-  if (!emailConf || !aiConf) return <div className="text-center py-12 text-gray-400">Caricamento...</div>
+  if (!emailConf || !aiConf || !pollingConf) return <div className="text-center py-12 text-gray-400">Caricamento...</div>
 
   return (
     <div>
@@ -88,6 +85,49 @@ export default function SettingsPage() {
           <button onClick={saveAI} className="mt-4 flex items-center gap-2 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700">
             {saved === 'ai' ? <CheckCircle className="h-4 w-4" /> : <Save className="h-4 w-4" />}
             {saved === 'ai' ? 'Salvato!' : 'Salva'}
+          </button>
+        </div>
+
+        {/* Polling settings */}
+        <div className="bg-white rounded-xl shadow-sm border p-6 lg:col-span-2">
+          <h2 className="text-lg font-semibold mb-4">Polling e Automazione</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-600 mb-1">Polling automatico</label>
+              <select
+                value={pollingConf.polling_enabled ? 'true' : 'false'}
+                onChange={(e) => updatePolling('polling_enabled', e.target.value === 'true')}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="false">Disattivato</option>
+                <option value="true">Attivato</option>
+              </select>
+            </div>
+            <Field
+              label="Intervallo polling (secondi)"
+              value={pollingConf.polling_interval_seconds}
+              onChange={(v) => updatePolling('polling_interval_seconds', parseInt(v) || 300)}
+              type="number"
+            />
+            <div>
+              <label className="block text-sm font-medium text-gray-600 mb-1">
+                Soglia auto-approvazione (0 = disattivata)
+              </label>
+              <input
+                type="number"
+                step="0.05"
+                min="0"
+                max="1"
+                value={pollingConf.auto_approve_threshold}
+                onChange={(e) => updatePolling('auto_approve_threshold', parseFloat(e.target.value) || 0)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+              />
+              <p className="text-xs text-gray-400 mt-1">Es. 0.9 = auto-approva se confidenza AI {'>'} 90%</p>
+            </div>
+          </div>
+          <button onClick={savePolling} className="mt-4 flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">
+            {saved === 'polling' ? <CheckCircle className="h-4 w-4" /> : <Save className="h-4 w-4" />}
+            {saved === 'polling' ? 'Salvato!' : 'Salva'}
           </button>
         </div>
       </div>

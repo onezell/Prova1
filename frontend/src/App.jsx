@@ -4,6 +4,8 @@ import Sidebar from './components/Sidebar'
 import Dashboard from './pages/Dashboard'
 import EmailList from './pages/EmailList'
 import EmailDetail from './pages/EmailDetail'
+import Approvals from './pages/Approvals'
+import Templates from './pages/Templates'
 import Stats from './pages/Stats'
 import SettingsPage from './pages/SettingsPage'
 import Login from './pages/Login'
@@ -53,6 +55,8 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/emails" element={<EmailList />} />
           <Route path="/emails/:id" element={<EmailDetail />} />
+          <Route path="/approvals" element={<Approvals />} />
+          <Route path="/templates" element={<Templates />} />
           <Route path="/stats" element={<Stats />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" />} />

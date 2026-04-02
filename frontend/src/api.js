@@ -2,16 +2,12 @@ import axios from 'axios'
 
 const api = axios.create({ baseURL: '/api' })
 
-// Attach JWT token to every request
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token')
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
+  if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
-// On 401, redirect to login
 api.interceptors.response.use(
   (res) => res,
   (err) => {
@@ -25,8 +21,7 @@ api.interceptors.response.use(
 )
 
 // Auth
-export const login = (username, password) =>
-  api.post('/auth/login', { username, password })
+export const login = (username, password) => api.post('/auth/login', { username, password })
 export const getMe = () => api.get('/auth/me')
 
 // Emails
@@ -39,6 +34,18 @@ export const correctCategory = (id, category) => api.post(`/emails/${id}/correct
 export const sendReply = (id, replyText) => api.post(`/emails/${id}/reply`, { email_id: id, reply_text: replyText })
 export const generateReply = (id, instructions = '') => api.post(`/emails/${id}/generate-reply?instructions=${encodeURIComponent(instructions)}`)
 
+// Approval workflow
+export const submitForApproval = (id, replyText) => api.post(`/emails/${id}/submit-for-approval`, { email_id: id, reply_text: replyText })
+export const approveEmail = (id, replyText = null) => api.post(`/emails/${id}/approve`, replyText ? { reply_text: replyText } : {})
+export const rejectEmail = (id) => api.post(`/emails/${id}/reject`)
+
+// Templates
+export const listTemplates = (category) => api.get('/templates', { params: category ? { category } : {} })
+export const createTemplate = (data) => api.post('/templates', data)
+export const getTemplate = (id) => api.get(`/templates/${id}`)
+export const updateTemplate = (id, data) => api.put(`/templates/${id}`, data)
+export const deleteTemplate = (id) => api.delete(`/templates/${id}`)
+
 // Stats
 export const getStats = () => api.get('/stats')
 
@@ -47,5 +54,10 @@ export const getEmailSettings = () => api.get('/settings/email')
 export const updateEmailSettings = (s) => api.put('/settings/email', s)
 export const getAISettings = () => api.get('/settings/ai')
 export const updateAISettings = (s) => api.put('/settings/ai', s)
+export const getPollingSettings = () => api.get('/settings/polling')
+export const updatePollingSettings = (s) => api.put('/settings/polling', s)
+
+// Seed
+export const seedData = () => api.post('/seed')
 
 export default api
